@@ -289,6 +289,232 @@ class WebController extends Controller
         ];
     }
 
+    public function generateUserAiMeal(Request $request)
+    {
+        $realtimeAPI = null;
+        if ($request->input('regenerate') === true || $request->input('regenerate') === 'true') {
+            $this->resetMealPlan();
+        }
+
+        try {
+            if (Ingredient::count() == 0 || Sauce::count() == 0) {
+                return response()->json(['error' => true, 'message' => "No ingredients/sauces available"]);
+            }
+
+            // BMI Calculation
+            $heightInMeters = $request->height / 100;
+            $bmi = $request->weight / ($heightInMeters * $heightInMeters);
+            $bmiOverview = match (true) {
+                $bmi < 18.5 => 'Underweight',
+                $bmi < 24.9 => 'Normal',
+                $bmi < 29.9 => 'Overweight',
+                default => 'Obese',
+            };
+
+            // BMR Calculation
+            $heightInCm = $request->height * 100;
+            if ($request->gender === 'male') {
+                $bmr = 10 * $request->weight + 6.25 * $heightInCm - 5 * $request->age + 5;
+
+                // Body Fat % for Male
+                $waist = $request->waist_circumference;
+                $neck = $request->neck_circumference;
+                $heightInInches = $request->height * 39.3701;
+                $bodyFat = 86.010 * log10($waist - $neck) - 70.041 * log10($heightInInches) + 36.76;
+            } else {
+                $bmr = 10 * $request->weight + 6.25 * $heightInCm - 5 * $request->age - 161;
+
+                // Body Fat % for Female
+                $waist = $request->waist_circumference;
+                $neck = $request->neck_circumference;
+                $hip = $request->hip_circumference ?? 0;
+                $heightInInches = $request->height * 39.3701;
+                $bodyFat = 163.205 * log10($waist + $hip - $neck) - 97.684 * log10($heightInInches) - 78.387;
+            }
+
+            $bodyFat = round($bodyFat, 2);
+
+            // Activity Factor mapping
+            $activityFactors = [
+                "Sedentary (little or no exercise)" => 1.2,
+                "Lightly active (1–3 days/week)" => 1.375,
+                "Moderately active (3–5 days/week)" => 1.55,
+                "Very active (6–7 days/week)" => 1.725,
+                "Super active (twice/day or physical job)" => 1.9,
+            ];
+
+            $activityFactor = $activityFactors[$request->activity_level] ?? 1.2;
+            $tdee = $bmr * $activityFactor;
+
+            $userData = [
+                'user-info' => [
+                    'age' => $request->age,
+                    'height' => $request->height,
+                    'weight' => $request->weight,
+                    'gender' => $request->gender,
+                    'activity_level' => $request->activity_level,
+                    'neck_circumference' => $request->neck_circumference,
+                    'waist_circumference' => $request->waist_circumference,
+                    'hip_circumference' => $request->hip_circumference,
+                    'bmi' => round($bmi, 2),
+                    'bmi_overview' => $bmiOverview,
+                    'bmr' => round($bmr),
+                    'tdee' => round($tdee),
+                    'body_fat' => $bodyFat,
+                ],
+                'conversation_history' => [], // Initialize conversation history
+                'current_day' => $request->current_day, // Track current day
+                'goal' => null,
+                'plan_period' => $request->plan_period,
+                'goal_explanation' => null,
+                'meals' => [] // Store accumulated meal plans
+            ];
+
+            $currentDay = $userData['current_day'];
+            $maxDays = $request->plan_period;
+
+            if ($currentDay > $maxDays) {
+                return response()->json(['error' => false, 'message' => "All 30 days completed!", 'completed' => true]);
+            }
+
+
+            // Generate prompt
+            if ($request->input('meal-type') == 'our-meals') {
+                $prompt = $this->ourMealPrompt($currentDay);
+            } else {
+                $prompt = $this->aiPrompt($currentDay, $userData);
+            }
+
+            // Try OpenAI Realtime API
+            $realtimeAPI = new RealtimeAIService();
+            $response = null;
+            $usingRealtime = false;
+
+            Log::info("Attempting OpenAI Realtime API for day {$currentDay}");
+
+            if ($realtimeAPI->connect()) {
+                try {
+                    $response = $realtimeAPI->generateMealPlan($prompt);
+                    $usingRealtime = true;
+                    Log::info("✅ Successfully used OpenAI Realtime API for day {$currentDay}");
+                } catch (Exception $e) {
+                    Log::warning("❌ Realtime API failed for day {$currentDay}: " . $e->getMessage());
+                    $realtimeAPI->disconnect();
+                    $realtimeAPI = null;
+                }
+            }
+
+            // Fallback to regular API if Realtime failed
+            if (!$response) {
+                Log::info("🔄 Falling back to regular API for day {$currentDay}");
+                $response = $this->generateMealPlan($prompt, []);
+                $usingRealtime = false;
+            }
+
+            Log::info("AI Response for day {$currentDay} (Realtime: " . ($usingRealtime ? 'Yes' : 'No') . "):");
+            Log::info($response);
+
+            // Validate JSON response
+            $jsonData = json_decode($response, true);
+            if (!$jsonData) {
+                // Try to clean the response if it has markdown formatting
+                $cleanedResponse = $this->cleanJsonResponse($response);
+                $jsonData = json_decode($cleanedResponse, true);
+
+                if (!$jsonData) {
+                    Log::error('Raw response: ' . $response);
+                    Log::error('Cleaned response: ' . $cleanedResponse);
+                    throw new Exception("Invalid JSON in AI response for day {$currentDay}");
+                }
+            }
+            if (!$jsonData) {
+                throw new Exception("Invalid JSON in AI response for day {$currentDay}");
+            }
+
+            $response = [];
+
+            // Process response (same as your existing logic)
+            if ($currentDay === 1 && isset($jsonData['goal'])) {
+//                session(['goal' => $jsonData['goal']]);
+                $response['goal'] = $userData['goal'];
+            }
+
+            if (isset($jsonData['meals'])) {
+                $currentMeals = $userData['meals'];
+//                $currentMeals = session('meals', []);
+                $currentMeals[] = $jsonData['meals'];
+//                session(['meals' => $currentMeals]);
+                $response['meals'] = $currentMeals;
+            }
+
+            if (isset($jsonData['daily_total'])) {
+                Log::info("----");
+                Log::info($jsonData['daily_total']);
+//                $currentDailyTotals = session('daily_total', []);
+                $currentDailyTotals = [];
+                $currentDailyTotals[] = $jsonData['daily_total'];
+//                session(['daily_total' => $currentDailyTotals]);
+                $response['daily_total'] = $currentDailyTotals;
+//                Log::info(session('daily_total'));
+                Log::info($response['daily_total']);
+                Log::info("----");
+            }
+
+//            session(['current_day' => $currentDay + 1]);
+//            $response['current_day'] = $currentDay + 1;
+            $newCalories = $jsonData['daily_total']['calories'];
+            if (session('total_calories')) {
+                $oldCalories = session('total_calories');
+                session(['total_calories' => $oldCalories + $newCalories]);
+            } else {
+                session(['total_calories' => $newCalories]);
+            }
+            $newMeals = count($jsonData['meals']);
+            if (session('total_meals')) {
+                $oldMeals = session('total_meals');
+                session(['total_meals' => $oldMeals + $newMeals]);
+            } else {
+                session(['total_meals' => $newMeals]);
+            }
+
+            $newPrice = $jsonData['daily_total']['price'];
+            if (session('total_price')) {
+                $oldPrice = session('total_price');
+                session(['total_price' => $oldPrice + $newPrice]);
+            } else {
+                session(['total_price' => $newPrice]);
+            }
+
+            // Prepare final response
+            $finalJson = [
+                'goal' => $response['goal'],
+                'meals' => $response['meals'],
+                'daily_total' => $response['daily_total'],
+                'current_day' => $currentDay,
+                'total_days' => $maxDays,
+                'total_price' => session('total_price'),
+                'total_calories' => session('total_calories'),
+                'total_meals' => session('total_meals'),
+            ];
+
+            file_put_contents(public_path('response.json'), json_encode($finalJson, JSON_PRETTY_PRINT));
+
+            return response()->json($finalJson);
+        } catch (Exception $e) {
+            Log::error('Error generating meal plan: ' . $e->getMessage());
+
+            return response()->json([
+                'error' => true,
+                'message' => "Something went wrong: " . $e->getMessage()
+            ], 500);
+        } finally {
+            // Always disconnect WebSocket
+            if ($realtimeAPI) {
+                $realtimeAPI->disconnect();
+            }
+        }
+    }
+
     // Usage in your controller
     public function generateAiMeal(Request $request)
     {
@@ -459,9 +685,13 @@ class WebController extends Controller
         return $response;
     }
 
-    public function aiPrompt($day)
+    public function aiPrompt($day, $userData = [])
     {
-        $user = session('user-info');
+        if($userData) {
+            $user = $userData['user-info'];
+        } else {
+            $user = session('user-info');
+        }
         if (!$user) {
             throw new \Exception('User info not found in session.');
         }
